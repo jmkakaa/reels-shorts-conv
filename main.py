@@ -2,6 +2,7 @@
 # -----------------------------------------------------------------------------
 # Конвертер 16:9 → 1:1 → 9:16 + видео-баннер (FFmpeg, Tkinter, без внешних pip пакетов)
 # + Авто-субтитры (faster-whisper) при экспорте и прожиг в кадр
+# + Размытый фон (из исходника) с дополнительным затемнением
 # -----------------------------------------------------------------------------
 
 import os
@@ -23,14 +24,17 @@ DEFAULT_VBITRATE = "6M"
 DEFAULT_ABITRATE = "192k"
 MARGIN_DEFAULT = 24
 
-# параметры укороченных субтитров (дефолт; можно менять из UI target_words)
-SUBS_MAX_CHARS = 22      # максимальная длина фразы, ориентир
+# --- Параметры укороченных субтитров
+SUBS_MAX_CHARS = 22      # ориентир: макс. символов в мини-фразе до разбиения
 SUBS_MIN_DUR = 0.60      # минимум показа (сек)
 SUBS_MAX_DUR = 4.50      # максимум показа (сек)
-# ширина безопасных полей внутри квадрата 1080×1080
-SUBS_SIDE_SAFE = 72           # px слева/справа
-SUBS_LINE_CHARS = 18          # макс. символов в строке .srt перед переносом
+SUBS_SIDE_SAFE = 72      # px безопасные поля внутри квадрата 1080×1080
+SUBS_LINE_CHARS = 18     # авто-перенос строки в .srt
 
+# --- Параметры размытого фона
+BG_DEFAULT_BLUR = 24     # сила boxblur (радиус)
+BG_DEFAULT_DIM = -0.18   # затемнение через eq=brightness
+BG_DEFAULT_EXTRA_DIM = 0.18  # дополнительная черная маска (прозрачность 0..0.8)
 
 # -------------------------
 # FFmpeg helpers
@@ -89,6 +93,7 @@ def fontfile_opt() -> str:
     return f":fontfile='{FONTFILE}'" if FONTFILE else ""
 
 def esc_text_for_drawtext(txt: str) -> str:
+    # https://ffmpeg.org/ffmpeg-filters.html#Notes-on-filtergraph-escaping
     txt = txt.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'").replace("\n", "\\n")
     return txt
 
@@ -96,7 +101,7 @@ def esc_path_for_filter(p: str) -> str:
     return p.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
 # -------------------------
-# Авто-субтитры (faster-whisper)
+# Авто-субтитры (faster-whisper) — короткие фразы
 # -------------------------
 
 def _sec_to_timestamp(t):
@@ -106,6 +111,22 @@ def _sec_to_timestamp(t):
     ms = int((t - s) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
+def _wrap_for_srt(text: str, max_chars: int = SUBS_LINE_CHARS) -> str:
+    """Дружелюбный перенос строк; libass обработает '\\n' как перенос."""
+    words = text.strip().split()
+    if not words:
+        return ""
+    lines, cur = [], ""
+    for w in words:
+        if not cur:
+            cur = w; continue
+        if len(cur) + 1 + len(w) <= max_chars:
+            cur += " " + w
+        else:
+            lines.append(cur); cur = w
+    if cur: lines.append(cur)
+    return "\n".join(lines)
+
 def _write_srt(segments, srt_path):
     with open(srt_path, "w", encoding="utf-8") as f:
         for i, seg in enumerate(segments, 1):
@@ -114,15 +135,11 @@ def _write_srt(segments, srt_path):
             text  = _wrap_for_srt(seg["text"].strip().replace("\n", " "), SUBS_LINE_CHARS)
             f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
 
-
 def _segments_to_word_chunks(segments, target_words=3,
                              max_chars=SUBS_MAX_CHARS,
                              min_dur=SUBS_MIN_DUR,
                              max_dur=SUBS_MAX_DUR):
-    """
-    Берём word_timestamps и режем на короткие фразы (~2–4 слова).
-    Возвращаем [{'start','end','text'}, ...]
-    """
+    """Режем по словарным таймкодам на мини-фразы."""
     chunks = []
     for seg in segments:
         words = getattr(seg, "words", None)
@@ -146,44 +163,36 @@ def _segments_to_word_chunks(segments, target_words=3,
                 if too_many_words or too_many_chars or too_long:
                     text = " ".join(buf)
                     end  = last_end
-                    # защита на слишком короткие фрагменты
                     if end - start < min_dur and chunks:
-                        # слей с предыдущим
                         chunks[-1]["end"] = end
                         chunks[-1]["text"] += " " + text
                     else:
                         chunks.append({"start": start, "end": end, "text": text})
                     buf = []; start = None; last_end = None
             if buf and start is not None and last_end is not None:
-                text = " ".join(buf)
-                end = last_end
+                text = " ".join(buf); end = last_end
                 if chunks and end - start < min_dur:
                     chunks[-1]["end"] = end
                     chunks[-1]["text"] += " " + text
                 else:
                     chunks.append({"start": start, "end": end, "text": text})
         else:
-            # Фоллбэк: нет word_timestamps — режем по словам равномерно
+            # Фоллбэк без word_timestamps — равномерно
             tokens = seg.text.strip().split()
-            if not tokens:
-                continue
-            i = 0
-            cur = seg.start
+            if not tokens: continue
+            i = 0; cur = seg.start
+            step = max(2, target_words)
             while i < len(tokens):
-                grp = tokens[i:i+max(2, target_words)]
+                grp = tokens[i:i+step]
                 dur = min(max_dur, max(min_dur, (seg.end - seg.start) * (len(grp) / max(1, len(tokens)))))
-                start = cur
-                end = min(seg.end, start + dur)
+                start = cur; end = min(seg.end, start + dur)
                 chunks.append({"start": start, "end": end, "text": " ".join(grp)})
-                cur = end
-                i += max(2, target_words)
+                cur = end; i += step
     return chunks
 
 def generate_subtitles_segments(input_media_path, language="ru", model_size="small",
                                 target_words=3):
-    """
-    Возвращает короткие сегменты [{start, end, text}] с помощью faster-whisper.
-    """
+    """Возвращает мини-фразы [{start,end,text}] через faster-whisper."""
     try:
         from faster_whisper import WhisperModel
     except Exception as e:
@@ -199,7 +208,7 @@ def generate_subtitles_segments(input_media_path, language="ru", model_size="sma
             segments, info = model.transcribe(
                 input_media_path,
                 language=language,
-                word_timestamps=True,           # ВАЖНО: таймкоды слов
+                word_timestamps=True,  # ВАЖНО: таймкоды слов
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 150},
                 beam_size=5,
@@ -240,21 +249,26 @@ def write_clip_srt_from_segments(segments, clip_start, clip_dur, srt_out_path):
     return srt_out_path
 
 # -------------------------
-# Построение filter_complex (с субтитрами)
+# Построение filter_complex (размытый фон + сабы + баннер)
 # -------------------------
 
 def build_filter_complex(
     mode: str, offset: float, dur: float,
     wm_text: str, wm_pos: str, wm_opacity: float,
     overlay_enabled: bool, overlay_scale_pct: int, overlay_pos: str, overlay_margin: int,
-    subs_path: str = ""
+    subs_path: str = "",
+    bg_blur: bool = True, bg_blur_strength: int = BG_DEFAULT_BLUR,
+    bg_dim: float = BG_DEFAULT_DIM, bg_extra_dim: float = BG_DEFAULT_EXTRA_DIM
 ) -> str:
     """
-      [0:v] crop/scale 1080x1080 -> (опц.) drawtext -> (опц.) subtitles -> pad до 1080x1920 -> [base]
-      (опц.) [1:v] setpts+scale -> overlay на [base] -> [outv]
+      [0:v] → (fg) crop/scale 1080x1080 → drawtext → subtitles → [fg]
+      [0:v] → (bg) scale to cover 1080x1920 → blur → dim → +mask → [bgd]
+      [bgd][fg] overlay center → [base]
+      (опц.) [1:v] setpts+scale → overlay на [base] → [outv]
     """
     ff = fontfile_opt()
 
+    # -- Foreground (квадрат 1080×1080)
     if mode == "center":
         crop = "crop=ih:ih:x=(iw-ih)/2:y=(ih-ih)/2"
     elif mode == "offset":
@@ -264,8 +278,9 @@ def build_filter_complex(
     else:
         crop = f"crop=ih:ih:x=(iw-ih)*(1-(t/{max(dur, 0.001):.6f})):y=(ih-ih)/2"
 
-    chain0 = f"[0:v]{crop},scale={OUTPUT_SQUARE}:{OUTPUT_SQUARE}"
+    fg = f"[0:v]{crop},scale={OUTPUT_SQUARE}:{OUTPUT_SQUARE},setsar=1"
 
+    # Водяной знак (текст)
     if wm_text.strip():
         ttxt = esc_text_for_drawtext(wm_text.strip())
         if wm_pos == "right-bottom":
@@ -278,33 +293,42 @@ def build_filter_complex(
             x, y = f"{MARGIN_DEFAULT}", f"{MARGIN_DEFAULT}"
         else:
             x, y = "(w-text_w)/2", "(h-text_h)/2"
-        chain0 += (
-            ",drawtext="
-            f"text='{ttxt}'{ff}:fontcolor=white@{max(0.0, min(1.0, wm_opacity))}:fontsize=46:"
-            f"box=1:boxcolor=black@0.35:boxborderw=10:x={x}:y={y}"
-        )
+        fg += (",drawtext="
+               f"text='{ttxt}'{ff}:fontcolor=white@{max(0.0, min(1.0, wm_opacity))}:fontsize=46:"
+               f"box=1:boxcolor=black@0.35:boxborderw=10:x={x}:y={y}")
 
+    # Субтитры в квадрате
     if subs_path:
         sp = esc_path_for_filter(os.path.abspath(subs_path))
-        ml = mr = max(0, int(SUBS_SIDE_SAFE))  # левый/правый внутренний отступ
-        chain0 += (
-            f",subtitles='{sp}':charenc=UTF-8:"
-            f"force_style='Fontname=Arial,Fontsize=32,Outline=3,Shadow=1,"
-            f"Alignment=2,WrapStyle=2,MarginV=20,MarginL={ml},MarginR={mr}'"
-        )
+        ml = mr = max(0, int(SUBS_SIDE_SAFE))
+        # ВНИМАНИЕ: в libass корректное имя свойства — FontName (с большой N)
+        fg += (f",subtitles='{sp}':charenc=UTF-8:"
+               "force_style='FontName=Arial,Fontsize=32,Outline=3,Shadow=1,"
+               f"Alignment=2,WrapStyle=2,MarginV=26,MarginL={ml},MarginR={mr}'")
+    fg += "[fg]"
 
-    # Паддинг 1:1 -> 9:16
-    pad_x = (OUTPUT_W - OUTPUT_SQUARE) // 2
-    pad_y = (OUTPUT_H - OUTPUT_SQUARE) // 2
-    chain0 += f",pad={OUTPUT_W}:{OUTPUT_H}:{pad_x}:{pad_y}:color=black[base]"
+    # -- Background 1080×1920
+    if bg_blur:
+        blur = max(0, int(bg_blur_strength))
+        dim = max(-1.0, min(1.0, float(bg_dim)))
+        bg = (f"[0:v]scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,"
+              f"crop={OUTPUT_W}:{OUTPUT_H},boxblur={blur}:1,eq=brightness={dim},setsar=1[bg]")
+    else:
+        bg = f"color=size={OUTPUT_W}x{OUTPUT_H}:color=black:d={max(dur,0.1):.3f}[bg]"
 
+    # Доп. затемнение маской
+    alpha = max(0.0, min(0.8, float(bg_extra_dim)))
+    shade = f"color=c=black@{alpha}:s={OUTPUT_W}x{OUTPUT_H}:d={max(dur,0.1):.3f}[shade]"
+    darken = "[bg][shade]overlay=shortest=1[bgd]"
+
+    # Сведение квадрата на фон
+    compose = "[bgd][fg]overlay=x=(main_w-w)/2:y=(main_h-h)/2:shortest=1[base]"
+
+    # Баннер
     if not overlay_enabled:
-        return f"{chain0};[base]null[outv]"
-
-    # Видео-баннер: обязательно сформировать [ov] (это важная правка)
+        return f"{fg};{bg};{shade};{darken};{compose};[base]null[outv]"
     ow = max(1, min(100, overlay_scale_pct)) * OUTPUT_W // 100
-    chain1 = f"[1:v]setpts=PTS-STARTPTS,scale={ow}:-2[ov]"
-
+    ov = f"[1:v]setpts=PTS-STARTPTS,scale={ow}:-2[ov]"
     m = max(0, overlay_margin)
     if overlay_pos == "top-left":
         ox, oy = f"{m}", f"{m}"
@@ -317,8 +341,8 @@ def build_filter_complex(
     else:
         ox, oy = "(main_w-w)/2", "(main_h-h)/2"
 
-    # ВКЛЮЧАЕМ chain1 в итоговый граф (чтобы баннер не «становился» основным видео)
-    return f"{chain0};{chain1};[base][ov]overlay=x={ox}:y={oy}:shortest=1[outv]"
+    ovl = f"[base][ov]overlay=x={ox}:y={oy}:shortest=1[outv]"
+    return f"{fg};{bg};{shade};{darken};{compose};{ov};{ovl}"
 
 # -------------------------
 # Команда FFmpeg
@@ -331,7 +355,9 @@ def build_ffmpeg_cmd(
     wm_text: str, wm_pos: str, wm_opacity: float,
     overlay_path: str, overlay_scale_pct: int, overlay_pos: str, overlay_margin: int,
     overlay_loop: bool,
-    subs_path: str = ""
+    subs_path: str = "",
+    bg_blur: bool = True, bg_blur_strength: int = BG_DEFAULT_BLUR,
+    bg_dim: float = BG_DEFAULT_DIM, bg_extra_dim: float = BG_DEFAULT_EXTRA_DIM
 ) -> list:
     ffmpeg = which_ffmpeg()
 
@@ -340,7 +366,9 @@ def build_ffmpeg_cmd(
         wm_text=wm_text, wm_pos=wm_pos, wm_opacity=wm_opacity,
         overlay_enabled=bool(overlay_path), overlay_scale_pct=overlay_scale_pct,
         overlay_pos=overlay_pos, overlay_margin=overlay_margin,
-        subs_path=subs_path
+        subs_path=subs_path,
+        bg_blur=bg_blur, bg_blur_strength=bg_blur_strength,
+        bg_dim=bg_dim, bg_extra_dim=bg_extra_dim
     )
 
     cmd = [ffmpeg, "-y"]
@@ -349,7 +377,7 @@ def build_ffmpeg_cmd(
 
     if overlay_path:
         if overlay_loop:
-            cmd += ["-stream_loop", "-1"]
+            cmd += ["-stream_loop", "-1"]  # зациклить баннер
         cmd += ["-i", overlay_path]
 
     cmd += ["-filter_complex", fc, "-map", "[outv]"]
@@ -371,13 +399,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("920x940")
+        self.geometry("930x1030")
 
         self.in_path = None
         self.meta = {"width": 0, "height": 0, "duration": 0.0}
 
         # Режим
-        self.export_mode = tk.StringVar(value="single")  # single|batch
+        self.export_mode = tk.StringVar(value="single")
         self.start_var = tk.DoubleVar(value=0.0)
         self.fps_var = tk.IntVar(value=DEFAULT_FPS)
         self.crf_var = tk.IntVar(value=DEFAULT_CRF)
@@ -402,7 +430,13 @@ class App(tk.Tk):
         self.subs_lang = tk.StringVar(value="ru")
         self.model_size = tk.StringVar(value="small")  # tiny/base/small/medium/large-v3
         self.subs_path = tk.StringVar(value="")
-        self.subs_words = tk.IntVar(value=3)           # НОВОЕ: слова в субтитре (≈)
+        self.subs_words = tk.IntVar(value=3)           # ≈ слов на фразу
+
+        # Фон (подложка)
+        self.bg_blur = tk.BooleanVar(value=True)
+        self.bg_blur_strength = tk.IntVar(value=BG_DEFAULT_BLUR)
+        self.bg_dim = tk.DoubleVar(value=BG_DEFAULT_DIM)
+        self.bg_extra_dim = tk.DoubleVar(value=BG_DEFAULT_EXTRA_DIM)
 
         self.status_var = tk.StringVar(value="Готов к работе")
         self._build_ui()
@@ -459,7 +493,7 @@ class App(tk.Tk):
         ttk.Button(lf_ov, text="Выбрать видео баннера…", command=self._choose_overlay).pack(side="left", padx=6, pady=6)
         self.overlay_label = ttk.Label(lf_ov, text="Не выбрано"); self.overlay_label.pack(side="left", padx=6)
         fr_ov2 = ttk.Frame(lf_ov); fr_ov2.pack(fill="x", pady=(6,0))
-        ttk.Label(fr_ov2, text="Размер баннера, % от 1080:").pack(side="left")
+        ttk.Label(fr_ov2, text="Размер баннера, % от ширины кадра (1080):").pack(side="left")
         ttk.Spinbox(fr_ov2, from_=10, to=100, textvariable=self.overlay_scale, width=5).pack(side="left", padx=6)
         ttk.Label(fr_ov2, text="Позиция").pack(side="left", padx=(12, 4))
         cbpos = ttk.Combobox(fr_ov2, state="readonly",
@@ -476,7 +510,6 @@ class App(tk.Tk):
         ttk.Label(lf_subs, text="Автогенерация при экспорте (можно выбрать свой .srt)").pack(side="left", padx=6)
         ttk.Button(lf_subs, text="Выбрать .srt…", command=self._pick_srt).pack(side="left", padx=8)
         self.subs_label = ttk.Label(lf_subs, text="(не выбрано)"); self.subs_label.pack(side="left", padx=6)
-
         fr_subs2 = ttk.Frame(lf_subs); fr_subs2.pack(fill="x", pady=(6,0))
         ttk.Label(fr_subs2, text="Язык").pack(side="left", padx=(0, 4))
         cb_lang = ttk.Combobox(fr_subs2, state="readonly", values=["ru","en","uk","de","fr","es","it","tr","kk"], width=6)
@@ -488,6 +521,21 @@ class App(tk.Tk):
         cb_model.bind("<<ComboboxSelected>>", lambda e: self.model_size.set(cb_model.get()))
         ttk.Label(fr_subs2, text="Слова в субтитре (≈)").pack(side="left", padx=(12, 4))
         ttk.Spinbox(fr_subs2, from_=2, to=5, textvariable=self.subs_words, width=5).pack(side="left")
+
+        # Фон (подложка)
+        lf_bg = ttk.LabelFrame(self, text="Фон (подложка)")
+        lf_bg.pack(fill="x", **pad)
+        ttk.Checkbutton(lf_bg, text="Размыть исходник вместо чёрного фона",
+                        variable=self.bg_blur).pack(anchor="w", padx=6, pady=(4,2))
+        fr_bg1 = ttk.Frame(lf_bg); fr_bg1.pack(fill="x", pady=(0,4))
+        ttk.Label(fr_bg1, text="Сила размытия").pack(side="left")
+        ttk.Spinbox(fr_bg1, from_=0, to=80, increment=2,
+                    textvariable=self.bg_blur_strength, width=6).pack(side="left", padx=8)
+        ttk.Label(fr_bg1, text="Затемнение (яркость)").pack(side="left", padx=(12, 4))
+        ttk.Scale(fr_bg1, from_=-0.5, to=0.3, variable=self.bg_dim, orient="horizontal").pack(side="left", fill="x", expand=True, padx=(0,8))
+        fr_bg2 = ttk.Frame(lf_bg); fr_bg2.pack(fill="x")
+        ttk.Label(fr_bg2, text="Доп. затемнение (маска)").pack(side="left")
+        ttk.Scale(fr_bg2, from_=0.0, to=0.6, variable=self.bg_extra_dim, orient="horizontal").pack(side="left", fill="x", expand=True, padx=(8,8))
 
         # Экспорт
         lf_exp = ttk.LabelFrame(self, text="Экспорт")
@@ -566,7 +614,7 @@ class App(tk.Tk):
         total = float(self.meta.get("duration", 0.0))
         dur = 60.0 if total >= 60.0 else max(0.1, total - start)
 
-        # --- Субтитры
+        # Субтитры
         subs_path = os.path.abspath(self.subs_path.get().strip()) if self.subs_path.get().strip() else ""
         if not subs_path:
             try:
@@ -595,6 +643,10 @@ class App(tk.Tk):
             overlay_pos=self.overlay_pos.get(), overlay_margin=int(self.overlay_margin.get()),
             overlay_loop=bool(self.overlay_loop.get()),
             subs_path=subs_path,
+            bg_blur=bool(self.bg_blur.get()),
+            bg_blur_strength=int(self.bg_blur_strength.get()),
+            bg_dim=float(self.bg_dim.get()),
+            bg_extra_dim=float(self.bg_extra_dim.get()),
         )
         self._run_ffmpeg(cmd, out_path)
 
@@ -659,6 +711,10 @@ class App(tk.Tk):
                 overlay_pos=self.overlay_pos.get(), overlay_margin=int(self.overlay_margin.get()),
                 overlay_loop=bool(self.overlay_loop.get()),
                 subs_path=clip_srt,
+                bg_blur=bool(self.bg_blur.get()),
+                bg_blur_strength=int(self.bg_blur_strength.get()),
+                bg_dim=float(self.bg_dim.get()),
+                bg_extra_dim=float(self.bg_extra_dim.get()),
             )
 
             self.status_var.set(f"Экспорт {i+1}/{n_clips}: {out_name}"); self.update_idletasks()
@@ -699,30 +755,6 @@ class App(tk.Tk):
 # -------------------------
 # Вспомогательное
 # -------------------------
-
-def _wrap_for_srt(text: str, max_chars: int = SUBS_LINE_CHARS) -> str:
-    """
-    Дружелюбно переносит строку на несколько, не разрывая слова.
-    Возвращает текст с \n, что libass превратит в перенос.
-    """
-    words = text.strip().split()
-    if not words:
-        return ""
-    lines, cur = [], ""
-    for w in words:
-        if not cur:
-            cur = w
-            continue
-        if len(cur) + 1 + len(w) <= max_chars:
-            cur += " " + w
-        else:
-            lines.append(cur)
-            cur = w
-    if cur:
-        lines.append(cur)
-    return "\n".join(lines)
-
-
 
 def seconds_to_hms(t: float) -> str:
     t = max(0, int(t))
