@@ -12,10 +12,11 @@ import shutil
 import math
 import threading
 import subprocess
+import tempfile
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-APP_TITLE = "Конвертер 16:9 → 1:1 → 9:16 + видео-баннер (FFmpeg) + авто-субтитры"
+APP_TITLE = "ReelsMaker"
 OUTPUT_SQUARE = 1080
 OUTPUT_W, OUTPUT_H = 1080, 1920
 DEFAULT_FPS = 30
@@ -28,17 +29,22 @@ MARGIN_DEFAULT = 24
 SUBS_MAX_CHARS = 22      # ориентир: макс. символов в мини-фразе до разбиения
 SUBS_MIN_DUR = 0.60      # минимум показа (сек)
 SUBS_MAX_DUR = 4.50      # максимум показа (сек)
-SUBS_SIDE_SAFE = 72      # px безопасные поля внутри квадрата 1080×1080
-SUBS_LINE_CHARS = 18     # авто-перенос строки в .srt
+SUBS_SIDE_SAFE = 72      # px безопасные поля слева/справа
+SUBS_LINE_CHARS = 16     # авто-перенос строки в .srt (чуть короче → компактнее)
+SUBS_BELOW_GAP = 200       # на сколько опустить субтитры ниже низа квадрата (px)
+ASS_PLAYRES_Y = 288      # базовое PlayResY для libass (для пересчёта MarginV)
+
+# Размер и стиль сабов
+SUBS_FONT_SIZE = 20
+SUBS_OUTLINE   = 2
+SUBS_SHADOW    = 1
 
 # --- Параметры размытого фона
 BG_DEFAULT_BLUR = 24     # сила boxblur (радиус)
 BG_DEFAULT_DIM = -0.18   # затемнение через eq=brightness
 BG_DEFAULT_EXTRA_DIM = 0.18  # дополнительная черная маска (прозрачность 0..0.8)
 
-# -------------------------
 # FFmpeg helpers
-# -------------------------
 
 def which_ffmpeg() -> str:
     p = shutil.which("ffmpeg")
@@ -139,14 +145,24 @@ def _segments_to_word_chunks(segments, target_words=3,
                              max_chars=SUBS_MAX_CHARS,
                              min_dur=SUBS_MIN_DUR,
                              max_dur=SUBS_MAX_DUR):
-    """Режем по словарным таймкодам на мини-фразы."""
+    """
+    Режем по словарным таймкодам на мини-фразы.
+    Фикс: при слиянии коротких фрагментов НЕ раздуваем текст предыдущего чанка,
+    а только удлиняем его время показа. Дополнительно — жёсткий лимит слов.
+    """
+    def wc(s: str) -> int:
+        return len([w for w in s.strip().split() if w])
+
+    HARD_CAP = max(2, target_words)  # нельзя показывать больше этого
     chunks = []
+
     for seg in segments:
         words = getattr(seg, "words", None)
         if words:
             buf = []
             start = None
             last_end = None
+
             for w in words:
                 wtxt = (w.word or "").strip()
                 if not wtxt:
@@ -156,39 +172,75 @@ def _segments_to_word_chunks(segments, target_words=3,
                 buf.append(wtxt)
                 last_end = w.end
 
-                too_many_words = len(buf) >= max(2, target_words)
+                # условия флашинга текущего буфера в чанк
+                too_many_words = len(buf) >= HARD_CAP
                 too_many_chars = len(" ".join(buf)) >= max_chars and len(buf) >= 2
                 too_long       = (last_end - start) >= max_dur
 
                 if too_many_words or too_many_chars or too_long:
                     text = " ".join(buf)
                     end  = last_end
-                    if end - start < min_dur and chunks:
-                        chunks[-1]["end"] = end
-                        chunks[-1]["text"] += " " + text
+                    dur  = end - start
+
+                    if dur < min_dur:
+                        if chunks:
+                            # НЕ добавляем слова в текст, только удлиняем предыдущий чанк
+                            # до min_dur или до текущего конца — что больше.
+                            prev = chunks[-1]
+                            need = max(min_dur - (prev["end"] - prev["start"]), 0.0)
+                            prev["end"] = max(prev["end"] + need, end)
+                        else:
+                            # нет предыдущего — создаём чанк с минимальной длительностью,
+                            # но текст не раздуваем сверх HARD_CAP
+                            end = max(end, start + min_dur)
+                            text = " ".join(buf[:HARD_CAP])
+                            chunks.append({"start": start, "end": end, "text": text})
                     else:
+                        # нормальный чанк, режем текст по HARD_CAP на всякий
+                        text = " ".join(text.split()[:HARD_CAP])
                         chunks.append({"start": start, "end": end, "text": text})
-                    buf = []; start = None; last_end = None
+
+                    buf = []
+                    start = None
+                    last_end = None
+
+            # хвост
             if buf and start is not None and last_end is not None:
-                text = " ".join(buf); end = last_end
-                if chunks and end - start < min_dur:
-                    chunks[-1]["end"] = end
-                    chunks[-1]["text"] += " " + text
+                text = " ".join(buf[:HARD_CAP])
+                end = last_end
+                dur = end - start
+                if dur < min_dur:
+                    if chunks:
+                        prev = chunks[-1]
+                        need = max(min_dur - (prev["end"] - prev["start"]), 0.0)
+                        prev["end"] = max(prev["end"] + need, end)
+                    else:
+                        end = max(end, start + min_dur)
+                        chunks.append({"start": start, "end": end, "text": text})
                 else:
                     chunks.append({"start": start, "end": end, "text": text})
+
         else:
-            # Фоллбэк без word_timestamps — равномерно
+            # Фоллбэк без word_timestamps — строгими порциями по target_words
             tokens = seg.text.strip().split()
-            if not tokens: continue
-            i = 0; cur = seg.start
+            if not tokens:
+                continue
+            i = 0
+            cur = seg.start
             step = max(2, target_words)
             while i < len(tokens):
                 grp = tokens[i:i+step]
+                # не набиваем текст сверх лимита
+                grp = grp[:HARD_CAP]
                 dur = min(max_dur, max(min_dur, (seg.end - seg.start) * (len(grp) / max(1, len(tokens)))))
-                start = cur; end = min(seg.end, start + dur)
+                start = cur
+                end = min(seg.end, start + dur)
                 chunks.append({"start": start, "end": end, "text": " ".join(grp)})
-                cur = end; i += step
+                cur = end
+                i += step
+
     return chunks
+
 
 def generate_subtitles_segments(input_media_path, language="ru", model_size="small",
                                 target_words=3):
@@ -249,7 +301,50 @@ def write_clip_srt_from_segments(segments, clip_start, clip_dur, srt_out_path):
     return srt_out_path
 
 # -------------------------
-# Построение filter_complex (размытый фон + сабы + баннер)
+# Вспомогательное
+# -------------------------
+
+def prepare_subs_path_for_ffmpeg(p: str) -> str:
+    """
+    Возвращает безопасный путь к .srt для фильтра subtitles:
+    - проверяет существование и ненулевой размер;
+    - если в пути есть пробелы/не-ASCII/кавычки — копирует в /tmp с ASCII-именем;
+    - иначе возвращает исходный.
+    """
+    if not p:
+        return ""
+    p = os.path.abspath(p)
+    try:
+        if not os.path.exists(p) or os.path.getsize(p) == 0:
+            print(f"[subs] skip: file not found or empty: {p}")
+            return ""
+    except Exception as e:
+        print(f"[subs] stat failed for {p}: {e}")
+        return ""
+
+    try:
+        p.encode("ascii")
+        only_ascii = True
+    except UnicodeEncodeError:
+        only_ascii = False
+
+    needs_copy = (not only_ascii) or (" " in p) or ("'" in p)
+    if not needs_copy:
+        return p
+
+    fd, tmp = tempfile.mkstemp(prefix="subs_", suffix=".srt")
+    os.close(fd)
+    try:
+        with open(p, "rb") as src, open(tmp, "wb") as dst:
+            dst.write(src.read())
+        print(f"[subs] using temp safe path: {tmp}")
+        return tmp
+    except Exception as e:
+        print(f"[subs] temp copy failed ({e}), fallback to original")
+        return p
+
+# -------------------------
+# Построение filter_complex (сабы под квадратом)
 # -------------------------
 
 def build_filter_complex(
@@ -261,14 +356,15 @@ def build_filter_complex(
     bg_dim: float = BG_DEFAULT_DIM, bg_extra_dim: float = BG_DEFAULT_EXTRA_DIM
 ) -> str:
     """
-      [0:v] → (fg) crop/scale 1080x1080 → drawtext → subtitles → [fg]
-      [0:v] → (bg) scale to cover 1080x1920 → blur → dim → +mask → [bgd]
+      [0:v] → (fg) crop/scale 1080x1080 → drawtext → [fg]
+      [0:v] → (bg) scale 1080x1920 → blur → dim → +mask → [bgd]
       [bgd][fg] overlay center → [base]
-      (опц.) [1:v] setpts+scale → overlay на [base] → [outv]
+      (опц.) [base] + subtitles (в нижней подложке) → [baseS]
+      (опц.) [1:v] overlay → [outv]
     """
     ff = fontfile_opt()
 
-    # -- Foreground (квадрат 1080×1080)
+    # Foreground (квадрат)
     if mode == "center":
         crop = "crop=ih:ih:x=(iw-ih)/2:y=(ih-ih)/2"
     elif mode == "offset":
@@ -280,7 +376,7 @@ def build_filter_complex(
 
     fg = f"[0:v]{crop},scale={OUTPUT_SQUARE}:{OUTPUT_SQUARE},setsar=1"
 
-    # Водяной знак (текст)
+    # Водяной знак внутри квадрата
     if wm_text.strip():
         ttxt = esc_text_for_drawtext(wm_text.strip())
         if wm_pos == "right-bottom":
@@ -296,18 +392,9 @@ def build_filter_complex(
         fg += (",drawtext="
                f"text='{ttxt}'{ff}:fontcolor=white@{max(0.0, min(1.0, wm_opacity))}:fontsize=46:"
                f"box=1:boxcolor=black@0.35:boxborderw=10:x={x}:y={y}")
-
-    # Субтитры в квадрате
-    if subs_path:
-        sp = esc_path_for_filter(os.path.abspath(subs_path))
-        ml = mr = max(0, int(SUBS_SIDE_SAFE))
-        # ВНИМАНИЕ: в libass корректное имя свойства — FontName (с большой N)
-        fg += (f",subtitles='{sp}':charenc=UTF-8:"
-               "force_style='FontName=Arial,Fontsize=32,Outline=3,Shadow=1,"
-               f"Alignment=2,WrapStyle=2,MarginV=26,MarginL={ml},MarginR={mr}'")
     fg += "[fg]"
 
-    # -- Background 1080×1920
+    # Background 1080×1920
     if bg_blur:
         blur = max(0, int(bg_blur_strength))
         dim = max(-1.0, min(1.0, float(bg_dim)))
@@ -321,14 +408,46 @@ def build_filter_complex(
     shade = f"color=c=black@{alpha}:s={OUTPUT_W}x{OUTPUT_H}:d={max(dur,0.1):.3f}[shade]"
     darken = "[bg][shade]overlay=shortest=1[bgd]"
 
-    # Сведение квадрата на фон
+    # Сведение квадрата на фон по центру
     compose = "[bgd][fg]overlay=x=(main_w-w)/2:y=(main_h-h)/2:shortest=1[base]"
+
+    parts = [fg, bg, shade, darken, compose]
+    base_label = "base"
+
+    # --- Субтитры: в нижней подложке, под квадратом
+    if subs_path:
+        sp = esc_path_for_filter(os.path.abspath(subs_path))
+
+        # высота нижней подложки (420 px при 1080→1920)
+        bar_h = (OUTPUT_H - OUTPUT_SQUARE) // 2
+        # хотим встать у "линии" (верх подложки), но на SUBS_BELOW_GAP ниже
+        desired_px_from_bottom = max(4, bar_h - SUBS_BELOW_GAP)  # px от низа кадра
+        # пересчёт в ASS-единицы (PlayResY=288)
+        margin_v_ass = round(desired_px_from_bottom * ASS_PLAYRES_Y / OUTPUT_H)
+        margin_v_ass = max(8, min(120, margin_v_ass))
+
+        ml = mr = max(0, int(SUBS_SIDE_SAFE))
+        subs_clause = (
+            f"[{base_label}]subtitles='{sp}':charenc=UTF-8:original_size={OUTPUT_W}x{OUTPUT_H}:"
+            "force_style='"
+            f"FontName=Arial,Fontsize={SUBS_FONT_SIZE},"
+            f"Outline={SUBS_OUTLINE},Shadow={SUBS_SHADOW},BorderStyle=1,"
+            "Alignment=2,WrapStyle=2,"
+            f"MarginV={margin_v_ass},MarginL={ml},MarginR={mr}"
+            "'[baseS]"
+        )
+        parts.append(subs_clause)
+        base_label = "baseS"
 
     # Баннер
     if not overlay_enabled:
-        return f"{fg};{bg};{shade};{darken};{compose};[base]null[outv]"
+        parts.append(f"[{base_label}]null[outv]")
+        return ';'.join(parts)
+
     ow = max(1, min(100, overlay_scale_pct)) * OUTPUT_W // 100
     ov = f"[1:v]setpts=PTS-STARTPTS,scale={ow}:-2[ov]"
+    parts.append(ov)
+
     m = max(0, overlay_margin)
     if overlay_pos == "top-left":
         ox, oy = f"{m}", f"{m}"
@@ -341,12 +460,10 @@ def build_filter_complex(
     else:
         ox, oy = "(main_w-w)/2", "(main_h-h)/2"
 
-    ovl = f"[base][ov]overlay=x={ox}:y={oy}:shortest=1[outv]"
-    return f"{fg};{bg};{shade};{darken};{compose};{ov};{ovl}"
+    parts.append(f"[{base_label}][ov]overlay=x={ox}:y={oy}:shortest=1[outv]")
+    return ';'.join(parts)
 
-# -------------------------
 # Команда FFmpeg
-# -------------------------
 
 def build_ffmpeg_cmd(
     in_path: str, out_path: str, start: float, duration: float,
@@ -391,9 +508,7 @@ def build_ffmpeg_cmd(
     ]
     return cmd
 
-# -------------------------
-# GUI
-# -------------------------
+# gui
 
 class App(tk.Tk):
     def __init__(self):
@@ -414,12 +529,12 @@ class App(tk.Tk):
         self.mode_var = tk.StringVar(value="center")     # center|offset|pan_lr|pan_rl
         self.offset_var = tk.DoubleVar(value=0.5)
 
-        # Водяной знак (текст)
-        self.wm_text = tk.StringVar(value="@yourbrand")
+        # Водяной знак
+        self.wm_text = tk.StringVar(value="@kino_wow_wow")
         self.wm_pos = tk.StringVar(value="right-bottom")
         self.wm_opacity = tk.DoubleVar(value=0.85)
 
-        # Видео-баннер (оверлей)
+        # Видео-баннер
         self.overlay_path = tk.StringVar(value="")
         self.overlay_scale = tk.IntVar(value=30)
         self.overlay_pos = tk.StringVar(value="top-right")
@@ -432,7 +547,7 @@ class App(tk.Tk):
         self.subs_path = tk.StringVar(value="")
         self.subs_words = tk.IntVar(value=3)           # ≈ слов на фразу
 
-        # Фон (подложка)
+        # Фон
         self.bg_blur = tk.BooleanVar(value=True)
         self.bg_blur_strength = tk.IntVar(value=BG_DEFAULT_BLUR)
         self.bg_dim = tk.DoubleVar(value=BG_DEFAULT_DIM)
@@ -487,7 +602,7 @@ class App(tk.Tk):
         ttk.Label(lf_wm, text="Прозрачность").pack(side="left", padx=(8, 0))
         ttk.Scale(lf_wm, from_=0.1, to=1.0, orient="horizontal", variable=self.wm_opacity).pack(side="left", fill="x", expand=True, padx=8)
 
-        # Видео-баннер (оверлей)
+        # Видео-баннер
         lf_ov = ttk.LabelFrame(self, text="Видео-баннер (оверлей)")
         lf_ov.pack(fill="x", **pad)
         ttk.Button(lf_ov, text="Выбрать видео баннера…", command=self._choose_overlay).pack(side="left", padx=6, pady=6)
@@ -522,7 +637,7 @@ class App(tk.Tk):
         ttk.Label(fr_subs2, text="Слова в субтитре (≈)").pack(side="left", padx=(12, 4))
         ttk.Spinbox(fr_subs2, from_=2, to=5, textvariable=self.subs_words, width=5).pack(side="left")
 
-        # Фон (подложка)
+        # Фон
         lf_bg = ttk.LabelFrame(self, text="Фон (подложка)")
         lf_bg.pack(fill="x", **pad)
         ttk.Checkbutton(lf_bg, text="Размыть исходник вместо чёрного фона",
@@ -548,7 +663,7 @@ class App(tk.Tk):
 
         ttk.Label(self, textvariable=self.status_var, anchor="w").pack(fill="x", padx=8, pady=8)
 
-    # --- Actions
+    # действия
 
     def _choose_file(self):
         p = filedialog.askopenfilename(title="Выберите видео", filetypes=[
@@ -632,6 +747,9 @@ class App(tk.Tk):
                 messagebox.showwarning("Субтитры", f"Автогенерация не удалась: {e}\nЭкспорт продолжится без субтитров.")
                 subs_path = ""
 
+        # безопасный путь для libass/ffmpeg (кириллица/пробелы)
+        subs_for_ff = prepare_subs_path_for_ffmpeg(subs_path)
+
         cmd = build_ffmpeg_cmd(
             in_path=self.in_path,
             out_path=out_path,
@@ -642,7 +760,7 @@ class App(tk.Tk):
             overlay_path=self.overlay_path.get(), overlay_scale_pct=int(self.overlay_scale.get()),
             overlay_pos=self.overlay_pos.get(), overlay_margin=int(self.overlay_margin.get()),
             overlay_loop=bool(self.overlay_loop.get()),
-            subs_path=subs_path,
+            subs_path=subs_for_ff,
             bg_blur=bool(self.bg_blur.get()),
             bg_blur_strength=int(self.bg_blur_strength.get()),
             bg_dim=float(self.bg_dim.get()),
@@ -700,6 +818,8 @@ class App(tk.Tk):
             elif manual_srt:
                 clip_srt = manual_srt
 
+            subs_for_ff = prepare_subs_path_for_ffmpeg(clip_srt)
+
             cmd = build_ffmpeg_cmd(
                 in_path=self.in_path,
                 out_path=out_path,
@@ -710,7 +830,7 @@ class App(tk.Tk):
                 overlay_path=self.overlay_path.get(), overlay_scale_pct=int(self.overlay_scale.get()),
                 overlay_pos=self.overlay_pos.get(), overlay_margin=int(self.overlay_margin.get()),
                 overlay_loop=bool(self.overlay_loop.get()),
-                subs_path=clip_srt,
+                subs_path=subs_for_ff,
                 bg_blur=bool(self.bg_blur.get()),
                 bg_blur_strength=int(self.bg_blur_strength.get()),
                 bg_dim=float(self.bg_dim.get()),
@@ -752,9 +872,7 @@ class App(tk.Tk):
             print("[ERROR] ffmpeg not found")
             raise RuntimeError("FFmpeg не найден. Установите его и убедитесь, что он в PATH.")
 
-# -------------------------
-# Вспомогательное
-# -------------------------
+# вспомоглка
 
 def seconds_to_hms(t: float) -> str:
     t = max(0, int(t))
