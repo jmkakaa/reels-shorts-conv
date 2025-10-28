@@ -365,14 +365,28 @@ def build_filter_complex(
     ff = fontfile_opt()
 
     # Foreground (квадрат)
+    square = "min(iw,ih)"
+    center_x = f"(iw-{square})/2"
+    center_y = f"(ih-{square})/2"
+    offset = max(0.0, min(1.0, float(offset)))
+    offset_expr = f"{offset:.6f}"
+    dur_safe = max(dur, 0.001)
+    progress = f"clip(t/{dur_safe:.6f},0,1)"
+
     if mode == "center":
-        crop = "crop=ih:ih:x=(iw-ih)/2:y=(ih-ih)/2"
+        x_expr, y_expr = center_x, center_y
     elif mode == "offset":
-        crop = f"crop=ih:ih:x=(iw-ih)*{max(0.0, min(1.0, offset))}:y=(ih-ih)/2"
+        x_expr = f"if(gte(iw,ih),(iw-ih)*{offset_expr},{center_x})"
+        y_expr = f"if(gte(iw,ih),{center_y},(ih-iw)*{offset_expr})"
     elif mode == "pan_lr":
-        crop = f"crop=ih:ih:x=(iw-ih)*(t/{max(dur, 0.001):.6f}):y=(ih-ih)/2"
+        x_expr = f"if(gte(iw,ih),(iw-ih)*{progress},{center_x})"
+        y_expr = f"if(gte(iw,ih),{center_y},(ih-iw)*{progress})"
     else:
-        crop = f"crop=ih:ih:x=(iw-ih)*(1-(t/{max(dur, 0.001):.6f})):y=(ih-ih)/2"
+        rev_progress = f"(1-{progress})"
+        x_expr = f"if(gte(iw,ih),(iw-ih)*{rev_progress},{center_x})"
+        y_expr = f"if(gte(iw,ih),{center_y},(ih-iw)*{rev_progress})"
+
+    crop = f"crop={square}:{square}:x={x_expr}:y={y_expr}"
 
     fg = f"[0:v]{crop},scale={OUTPUT_SQUARE}:{OUTPUT_SQUARE},setsar=1"
 
