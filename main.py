@@ -1,10 +1,3 @@
-# main.py
-# -----------------------------------------------------------------------------
-# Конвертер 16:9 → 1:1 → 9:16 + видео-баннер (FFmpeg, Tkinter, без внешних pip пакетов)
-# + Авто-субтитры (faster-whisper) при экспорте и прожиг в кадр
-# + Размытый фон (из исходника) с дополнительным затемнением
-# -----------------------------------------------------------------------------
-
 import os
 import json
 import shlex
@@ -25,27 +18,26 @@ DEFAULT_VBITRATE = "6M"
 DEFAULT_ABITRATE = "192k"
 MARGIN_DEFAULT = 24
 
-# --- Параметры укороченных субтитров
-SUBS_MAX_CHARS = 22      # ориентир: макс. символов в мини-фразе до разбиения
-SUBS_MIN_DUR = 0.60      # минимум показа (сек)
-SUBS_MAX_DUR = 4.50      # максимум показа (сек)
-SUBS_SIDE_SAFE = 72      # px безопасные поля слева/справа
-SUBS_LINE_CHARS = 16     # авто-перенос строки в .srt (чуть короче → компактнее)
-SUBS_BELOW_GAP = 200       # на сколько опустить субтитры ниже низа квадрата (px)
-ASS_PLAYRES_Y = 288      # базовое PlayResY для libass (для пересчёта MarginV)
+
+SUBS_MAX_CHARS = 22 # макс. символов
+SUBS_MIN_DUR = 0.60 # минимум показа
+SUBS_MAX_DUR = 4.50 # максимум показа
+SUBS_SIDE_SAFE = 72  # безопасные поля
+SUBS_LINE_CHARS = 16 # автоперенос строки
+SUBS_BELOW_GAP = 200 # на сколько опустить субтитры
+ASS_PLAYRES_Y = 28
 
 # Размер и стиль сабов
 SUBS_FONT_SIZE = 20
 SUBS_OUTLINE   = 2
 SUBS_SHADOW    = 1
 
-# --- Параметры размытого фона
-BG_DEFAULT_BLUR = 24     # сила boxblur (радиус)
+# Параметры размытого фона
+BG_DEFAULT_BLUR = 24     # сила boxblur
 BG_DEFAULT_DIM = -0.18   # затемнение через eq=brightness
-BG_DEFAULT_EXTRA_DIM = 0.18  # дополнительная черная маска (прозрачность 0..0.8)
+BG_DEFAULT_EXTRA_DIM = 0.18  # дополнительная черная маска
 
-# FFmpeg helpers
-
+# ffmpeg helpers
 def which_ffmpeg() -> str:
     p = shutil.which("ffmpeg")
     if not p:
@@ -74,9 +66,6 @@ def probe_video(path: str) -> dict:
     dur = float(data.get("format", {}).get("duration", 0.0))
     return {"width": w, "height": h, "duration": dur}
 
-# -------------------------
-# Шрифт и экранирование для drawtext/ass
-# -------------------------
 
 def detect_fontfile() -> str:
     candidates = [
@@ -106,10 +95,8 @@ def esc_text_for_drawtext(txt: str) -> str:
 def esc_path_for_filter(p: str) -> str:
     return p.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
-# -------------------------
-# Авто-субтитры (faster-whisper) — короткие фразы
-# -------------------------
 
+# авто субтитры
 def _sec_to_timestamp(t):
     h = int(t // 3600); t -= h*3600
     m = int(t // 60);   t -= m*60
@@ -118,7 +105,6 @@ def _sec_to_timestamp(t):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 def _wrap_for_srt(text: str, max_chars: int = SUBS_LINE_CHARS) -> str:
-    """Дружелюбный перенос строк; libass обработает '\\n' как перенос."""
     words = text.strip().split()
     if not words:
         return ""
@@ -153,7 +139,7 @@ def _segments_to_word_chunks(segments, target_words=3,
     def wc(s: str) -> int:
         return len([w for w in s.strip().split() if w])
 
-    HARD_CAP = max(2, target_words)  # нельзя показывать больше этого
+    HARD_CAP = max(2, target_words)
     chunks = []
 
     for seg in segments:
@@ -184,14 +170,10 @@ def _segments_to_word_chunks(segments, target_words=3,
 
                     if dur < min_dur:
                         if chunks:
-                            # НЕ добавляем слова в текст, только удлиняем предыдущий чанк
-                            # до min_dur или до текущего конца — что больше.
                             prev = chunks[-1]
                             need = max(min_dur - (prev["end"] - prev["start"]), 0.0)
                             prev["end"] = max(prev["end"] + need, end)
                         else:
-                            # нет предыдущего — создаём чанк с минимальной длительностью,
-                            # но текст не раздуваем сверх HARD_CAP
                             end = max(end, start + min_dur)
                             text = " ".join(buf[:HARD_CAP])
                             chunks.append({"start": start, "end": end, "text": text})
@@ -221,7 +203,6 @@ def _segments_to_word_chunks(segments, target_words=3,
                     chunks.append({"start": start, "end": end, "text": text})
 
         else:
-            # Фоллбэк без word_timestamps — строгими порциями по target_words
             tokens = seg.text.strip().split()
             if not tokens:
                 continue
@@ -244,12 +225,10 @@ def _segments_to_word_chunks(segments, target_words=3,
 
 def generate_subtitles_segments(input_media_path, language="ru", model_size="small",
                                 target_words=3):
-    """Возвращает мини-фразы [{start,end,text}] через faster-whisper."""
     try:
         from faster_whisper import WhisperModel
     except Exception as e:
         raise RuntimeError(
-            "Для авто-субтитров установите пакет: python3 -m pip install faster-whisper"
         ) from e
 
     compute_try_order = ["int8_float16", "int8", "float16", "int8_float32", "float32"]
@@ -300,17 +279,7 @@ def write_clip_srt_from_segments(segments, clip_start, clip_dur, srt_out_path):
     _write_srt(sel, srt_out_path)
     return srt_out_path
 
-# -------------------------
-# Вспомогательное
-# -------------------------
-
 def prepare_subs_path_for_ffmpeg(p: str) -> str:
-    """
-    Возвращает безопасный путь к .srt для фильтра subtitles:
-    - проверяет существование и ненулевой размер;
-    - если в пути есть пробелы/не-ASCII/кавычки — копирует в /tmp с ASCII-именем;
-    - иначе возвращает исходный.
-    """
     if not p:
         return ""
     p = os.path.abspath(p)
@@ -343,10 +312,7 @@ def prepare_subs_path_for_ffmpeg(p: str) -> str:
         print(f"[subs] temp copy failed ({e}), fallback to original")
         return p
 
-# -------------------------
 # Построение filter_complex (сабы под квадратом)
-# -------------------------
-
 def build_filter_complex(
     mode: str, offset: float, dur: float,
     wm_text: str, wm_pos: str, wm_opacity: float,
@@ -408,7 +374,6 @@ def build_filter_complex(
                f"box=1:boxcolor=black@0.35:boxborderw=10:x={x}:y={y}")
     fg += "[fg]"
 
-    # Background 1080×1920
     if bg_blur:
         blur = max(0, int(bg_blur_strength))
         dim = max(-1.0, min(1.0, float(bg_dim)))
@@ -416,27 +381,21 @@ def build_filter_complex(
               f"crop={OUTPUT_W}:{OUTPUT_H},boxblur={blur}:1,eq=brightness={dim},setsar=1[bg]")
     else:
         bg = f"color=size={OUTPUT_W}x{OUTPUT_H}:color=black:d={max(dur,0.1):.3f}[bg]"
-
-    # Доп. затемнение маской
     alpha = max(0.0, min(0.8, float(bg_extra_dim)))
     shade = f"color=c=black@{alpha}:s={OUTPUT_W}x{OUTPUT_H}:d={max(dur,0.1):.3f}[shade]"
     darken = "[bg][shade]overlay=shortest=1[bgd]"
-
-    # Сведение квадрата на фон по центру
     compose = "[bgd][fg]overlay=x=(main_w-w)/2:y=(main_h-h)/2:shortest=1[base]"
 
     parts = [fg, bg, shade, darken, compose]
     base_label = "base"
 
-    # --- Субтитры: в нижней подложке, под квадратом
     if subs_path:
         sp = esc_path_for_filter(os.path.abspath(subs_path))
 
-        # высота нижней подложки (420 px при 1080→1920)
         bar_h = (OUTPUT_H - OUTPUT_SQUARE) // 2
-        # хотим встать у "линии" (верх подложки), но на SUBS_BELOW_GAP ниже
+
         desired_px_from_bottom = max(4, bar_h - SUBS_BELOW_GAP)  # px от низа кадра
-        # пересчёт в ASS-единицы (PlayResY=288)
+
         margin_v_ass = round(desired_px_from_bottom * ASS_PLAYRES_Y / OUTPUT_H)
         margin_v_ass = max(8, min(120, margin_v_ass))
 
